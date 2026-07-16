@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# conn - connection registry + pass-backed credential helper
+# Registry: ~/.config/conn/registry.tsv (TSV: name type host port user notes)
+# Secrets:  pass store under conn/<name>
+set -euo pipefail
+
+REG="$HOME/.config/conn/registry.tsv"
+mkdir -p "$(dirname "$REG")"
+[[ -f "$REG" ]] || printf 'name\ttype\thost\tport\tuser\tnotes\n' > "$REG"
+
+usage() {
+  cat <<EOF
+conn list                                          show all
+conn show <name>                                   show row + password
+conn get <name> <field>                            host|port|user|type|notes|password
+conn add <name> <type> <host> <port> <user> [notes]   then prompts for password (empty = none)
+conn rm <name>                                     remove row + secret
+conn go <name> [extra args...]                     auto-launch client for type
+EOF
+}
+
+row_for() {
+  awk -F'\t' -v n="$1" 'NR>1 && $1==n {print; found=1; exit} END{if(!found) exit 1}' "$REG"
+}
+
+cmd_list() {
+  column -t -s $'\t' "$REG"
+}
+
+cmd_show() {
+  local row; row=$(row_for "$1") || { echo "not found: $1" >&2; exit 1; }
+  echo "$row" | awk -F'\t' '{printf "name:  %s\ntype:  %s\nhost:  %s\nport:  %s\nuser:  %s\nnotes: %s\n",$1,$2,$3,$4,$5,$6}'
+  local pw; pw=$(pass show "conn/$1" 2>/dev/null || echo "(no password stored)")
+  echo "pass:  $pw"
+}
+
+cmd_get() {
+  local row; row=$(row_for "$1") || { echo "not found: $1" >&2; exit 1; }
+  case "$2" in
+    name)  echo "$row" | cut -f1 ;;
+    type)  echo "$row" | cut -f2 ;;
+    host)  echo "$row" | cut -f3 ;;
+    port)  echo "$row" | cut -f4 ;;
+    user)  echo "$row" | cut -f5 ;;
+    notes) echo "$row" | cut -f6 ;;
+    password|pw) pass show "conn/$1" 2>/dev/null ;;
+    *) echo "unknown field: $2" >&2; exit 1 ;;
+  esac
+}
+
+cmd_add() {
+  local name="$1" type="$2" host="$3" port="$4" user="$5"; shift 5
+  local notes="${*:-}"
+  if row_for "$name" >/dev/null 2>&1; then echo "exists: $name (use rm first)" >&2; exit 1; fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$type" "$host" "$port" "$user" "$notes" >> "$REG"
+  read -r -s -p "password for $name (empty to skip): " pw; echo
+  if [[ -n "$pw" ]]; then
+    printf '%s\n' "$pw" | pass insert -m "conn/$name" >/dev/null
+  fi
+  echo "added: $name"
+}
+
+cmd_rm() {
+  local name="$1"
+  if ! row_for "$name" >/dev/null 2>&1; then echo "not found: $name" >&2; exit 1; fi
+  awk -F'\t' -v n="$name" 'NR==1 || $1!=n' "$REG" > "$REG.tmp" && mv "$REG.tmp" "$REG"
+  pass rm -f "conn/$name" 2>/dev/null || true
+  echo "removed: $name"
+}
+
+cmd_go() {
+  local name="$1"; shift || true
+  local row; row=$(row_for "$name") || { echo "not found: $name" >&2; exit 1; }
+  local type host port user
+  type=$(echo "$row" | cut -f2)
+  host=$(echo "$row" | cut -f3)
+  port=$(echo "$row" | cut -f4)
+  user=$(echo "$row" | cut -f5)
+  local notes; notes=$(echo "$row" | cut -f6)
+  local pw; pw=$(pass show "conn/$name" 2>/dev/null || echo "")
+
+  # parse db=<name> from notes (first match wins)
+  local db_from_notes=""
+  if [[ "$notes" =~ (^|[[:space:];,])db=([^[:space:];,]+) ]]; then
+    db_from_notes="${BASH_REMATCH[2]}"
+  fi
+  # detect if caller already passed -d
+  local has_d=0 a
+  for a in "$@"; do [[ "$a" == "-d" ]] && { has_d=1; break; }; done
+
+  case "$type" in
+    ssh)
+      if [[ -n "$pw" ]]; then
+        command -v sshpass >/dev/null || { echo "install sshpass: sudo apt install sshpass" >&2; exit 2; }
+        sshpass -p "$pw" ssh -p "$port" "$user@$host" "$@"
+      else
+        ssh -p "$port" "$user@$host" "$@"
+      fi ;;
+    postgres|pg)
+      command -v psql >/dev/null || { echo "install psql: sudo apt install postgresql-client" >&2; exit 2; }
+      PGPASSWORD="$pw" psql -h "$host" -p "$port" -U "$user" "$@" ;;
+    mysql|mariadb)
+      command -v mysql >/dev/null || { echo "install mysql client" >&2; exit 2; }
+      mysql -h "$host" -P "$port" -u "$user" -p"$pw" "$@" ;;
+    mssql|sqlserver)
+      if command -v sqlcmd >/dev/null; then
+        local azure_flags=()
+        [[ "$host" == *".database.windows.net" ]] && azure_flags=(-N -C)
+        if [[ $has_d -eq 0 && -n "$db_from_notes" ]]; then
+          sqlcmd -S "$host,$port" -U "$user" -P "$pw" -d "$db_from_notes" "${azure_flags[@]}" "$@"
+        else
+          sqlcmd -S "$host,$port" -U "$user" -P "$pw" "${azure_flags[@]}" "$@"
+        fi
+      else
+        echo "install sqlcmd: see https://learn.microsoft.com/sql/tools/sqlcmd/sqlcmd-utility" >&2; exit 2
+      fi ;;
+    redis)
+      command -v redis-cli >/dev/null || { echo "install redis-tools" >&2; exit 2; }
+      redis-cli -h "$host" -p "$port" ${pw:+-a "$pw"} "$@" ;;
+    rdp)
+      command -v xfreerdp >/dev/null || { echo "install freerdp2-x11" >&2; exit 2; }
+      xfreerdp "/v:$host:$port" "/u:$user" "/p:$pw" "$@" ;;
+    *)
+      local handler="$HOME/.config/conn/handlers/$type.sh"
+      if [[ -x "$handler" ]]; then
+        "$handler" "$host" "$port" "$user" "$pw" "$notes" "$@"
+      else
+        echo "unknown type: $type (no built-in launcher, no handler at $handler)" >&2; exit 2
+      fi ;;
+  esac
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  list|ls) cmd_list ;;
+  show)    cmd_show "$@" ;;
+  get)     cmd_get "$@" ;;
+  add)     cmd_add "$@" ;;
+  rm|del)  cmd_rm "$@" ;;
+  go)      cmd_go "$@" ;;
+  *) usage; exit 1 ;;
+esac

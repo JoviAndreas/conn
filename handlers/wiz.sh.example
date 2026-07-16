@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# WiZ smart bulb handler. Called by `conn go <name> [subcmd args...]`
+# Args from conn: host port user pw notes [subcmd ...]
+set -euo pipefail
+HOST="$1"; PORT="$2"; shift 5  # drop host port user pw notes
+
+send() {
+  local payload="$1"
+  echo -n "$payload" | timeout 2 nc -u -w1 "$HOST" "$PORT" 2>/dev/null
+  echo
+}
+
+sub="${1:-status}"; shift || true
+
+case "$sub" in
+  status|get|getPilot)
+    send '{"method":"getPilot","params":{}}' ;;
+  on)
+    send '{"method":"setPilot","params":{"state":true}}' ;;
+  off)
+    send '{"method":"setPilot","params":{"state":false}}' ;;
+  dim)
+pct="${1:?usage: dim <0-100>}"
+    send "{\"method\":\"setPilot\",\"params\":{\"state\":true,\"dimming\":$pct}}" ;;
+  temp)
+k="${1:?usage: temp <2200-6500>}"
+    send "{\"method\":\"setPilot\",\"params\":{\"state\":true,\"temp\":$k}}" ;;
+  rgb)
+r="${1:?usage: rgb <r> <g> <b>}" g="${2:?}" b="${3:?}"
+    send "{\"method\":\"setPilot\",\"params\":{\"state\":true,\"r\":$r,\"g\":$g,\"b\":$b}}" ;;
+  scene)
+s="${1:?usage: scene <1-32>}"
+    send "{\"method\":\"setPilot\",\"params\":{\"state\":true,\"sceneId\":$s}}" ;;
+  raw)
+    send "${1:?usage: raw <json>}" ;;
+  *)
+    cat <<EOF >&2
+wiz handler subcommands:
+  status                  show current state (default)
+  on | off
+  dim <0-100>
+  temp <2200-6500>        kelvin (warm-cool)
+  rgb <r> <g> <b>         0-255 each
+  scene <1-32>            preset id (6=Cozy, 11=TV time, 14=Night light)
+  raw <json>              send raw JSON payload
+EOF
+    exit 1 ;;
+esac
